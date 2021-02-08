@@ -1,21 +1,45 @@
-// functon
-// Flow meter
+// Rick Steeves
+// 210207
+//
+// Flow monitor code for integration into MisterHouse
+// Using the YF-S201 Water Flow Sensor(s)
+// Configured for two separate flow sensors on an Arduino Ethernet Shield with SSD
+// Log date set vi NTP (which periodically renews the time/date)
+// Data is logged twice:
+//   last.txt is the last total flow (so total flow persists from one boot to the next)
+//   simple.txt is comma-delimited for data responses
+//
+// Output is: 
+//   Output to Serial
+//   Displayed on LCD screen
+//   Output as a web page (values then read in by MisterHouse)
+
+
+// functions
+// Flow sensor
 // LCD
 // SD Card
 // NTP/Ethernet (reset every 7 days)
-// web server (in progress)
+// web server
 
-//This is the flowmeter input pin on the Arduino
-#define flowMonitorPin1 2   
-// 0 = digital pin 2
-#define flowMonitorPin2 3
+//This is the flow sensor input pin on the Arduino
+#define flowSensorPin1 2
+// defining flowSensorPin2 as 3 doesn't work.
+
+// YF - S201: every liter of water that flows, the Hall Sensor outputs 450 Pulses
+// YF – S402: every liter of water that flows, the Hall Sensor outputs 4380 pulses
+//#define pulse 2.25
+// calibrated up 25%
+#define pulse 2.8125
+   
+const int flowInterval = 30;
 double flowRate1  = 0;    //This is the value we intend to calculate.
-double flowMinute1[60] = {}; // tracking a running hourly total
+double flowMinute1[flowInterval] = {}; // tracking a running incremental total
 double flowHour1 = 0; // tracking a running hourly total
 double flowTotal1 = 0;   //This is the value we intend to calculate.
 double flowRate2  = 0;    //This is the value we intend to calculate.
-double flowMinute2[60] = {}; // tracking a running hourly total
-double flowHour2  = 0; // tracking a running hourly total
+double flowMinute2[flowInterval] = {}; // tracking a running hourly total
+double flowHour2  = 0; // tracking a running incremental total
 double flowTotal2 = 0;   //This is the value we intend to calculate.
 int flowCounter = 0;   // to loop through our array counting minutes;
 volatile int count1 = 0; //This integer needs to be set as volatile to ensure it updates correctly during the interrupt process.
@@ -30,6 +54,11 @@ unsigned long cloopTime;
 // 0 = digital pin 3
 #define sensorInterrupt2 1
 String logtime = String(30); // a calculated log time
+String flowRate = String(16); // Used for Display
+String flowMinute = String(16); // Used for Display
+String flowHour = String(16); // Used for Display
+String flowTotal = String(16); // used for Display
+String flowLCD = String(16); // used for Display
 
 //LCD
 // https://www.makerguides.com/character-lcd-arduino-tutorial/
@@ -44,8 +73,16 @@ String logtime = String(30); // a calculated log time
 // 11 – 14 D4 – D7 Pin 4 – 7 Arduino Data bus lines used for 4-bit mode [What we are using]
 // 15  A (LED-)  5 V Arduino Anode for LCD backlight    [ These are reversed from the website - Rick ]
 // 16  K (LED+)  GND Arduino Cathode for LCD backlight  [ These are reversed from the website - Rick ]
+//LiquidCrystal lcd(rs, enable, d4, d5, d6, d7);
 #include <LiquidCrystal.h>
-LiquidCrystal lcd( 4, 5, 6, 7, 8, 9 ); // Creates an LC object. Parameters: (rs, enable, d4, d5, d6, d7)
+
+// Breadboard
+//LiquidCrystal lcd( 4, 5, 6, 7, 8, 9 ); // Creates an LC object. Parameters: (rs, enable, d4, d5, d6, d7)
+// PCB
+//LiquidCrystal lcd( 9, 8, 7, 6, 5, 4 ); // Creates an LC object. Parameters: (rs, enable, d4, d5, d6, d7)
+const int rs = 9, en = 8, d4 = 7, d5 = 6, d6 = 5, d7 = 4;
+LiquidCrystal lcd(rs, en, d4, d5, d6, d7);
+
 
 // SD Card
 #include <SD.h>
@@ -92,12 +129,10 @@ EthernetServer server(80);
 
 void setup() {
   // put your setup code here, to run once:
-  // Flowmeter input
-  pinMode(flowMonitorPin1, INPUT);           //Sets the pin as an input
-  digitalWrite(flowMonitorPin1, HIGH); // Optional Internal Pull-Up
-  pinMode(flowMonitorPin2, INPUT);           //Sets the pin as an input
-  digitalWrite(flowMonitorPin2, HIGH); // Optional Internal Pull-Up
-  //pinMode(flowMonitorPin1, INPUT_PULLUP);           //Sets the pin as an input, and use the internal Arduino pullup instead of the resistor
+  // Flow sensor input
+  pinMode(flowSensorPin1, INPUT);           //Sets the pin as an input
+  digitalWrite(flowSensorPin1, HIGH); // Optional Internal Pull-Up
+  //pinMode(flowSensorPin1, INPUT_PULLUP);           //Sets the pin as an input, and use the internal Arduino pullup instead of the resistor
   Serial.begin(9600);  //Start Serial
   while (!Serial) { ; } // wait for serial port to connect. Needed for native USB port only
 
@@ -136,15 +171,16 @@ void setup() {
   if (myFile) {
     String lastflow = myFile.readStringUntil('\r');
     Serial.println("Last Total (last.txt):" + lastflow);
-    // parse the CSV string of no more than 2 items
-    for (int i = 0; i < lastflow.length(); i++) {
-      if (lastflow.substring(i, i+1) == ",") {
-        flowTotal1 = lastflow.substring(0,i).toDouble();
-        flowTotal2 = lastflow.substring(i+1).toDouble();
-        // no need to keep going once we find the comma
-        break;
-      }
-    }
+//    // parse a CSV string of no more than 2 items
+//    for (int i = 0; i < lastflow.length(); i++) {
+//      if (lastflow.substring(i, i+1) == ",") {
+//        flowTotal1 = lastflow.substring(0,i).toDouble();
+//        flowTotal2 = lastflow.substring(i+1).toDouble();
+//        // no need to keep going once we find the comma
+//        break;
+//      }
+//    }
+    flowTotal1 = lastflow.toDouble();
     Serial.println("flowTotal1:" + String(flowTotal1));
     Serial.println("flowTotal2:" + String(flowTotal2));
     // close the file:
@@ -187,13 +223,15 @@ void setup() {
   
   // Web server
   server.begin();
-  Serial.println("Web Server:" + String(Ethernet.localIP()));
+  Serial.print("Web Server: ");
+  Serial.println(Ethernet.localIP());
 
-  attachInterrupt(sensorInterrupt1, Flow1, RISING);  //Configures interrupt 0 (pin 2 on the Arduino Uno) to run the function "Flow". // sensorInterrupt = 0
-  attachInterrupt(sensorInterrupt2, Flow2, RISING);  //Configures interrupt 0 (pin 2 on the Arduino Uno) to run the function "Flow". // sensorInterrupt = 0
+  attachInterrupt(sensorInterrupt1, Flow1, RISING);  //Configures interrupt 0 (pin 2 on the Arduino Uno) to run the function "Flow1". // sensorInterrupt = 0
+  attachInterrupt(sensorInterrupt2, Flow2, RISING);  //Configures interrupt 0 (pin 2 on the Arduino Uno) to run the function "Flow2". // sensorInterrupt = 0
   interrupts();   //Enables interrupts on the Arduino
-  Alarm.timerRepeat(7200, callNTP);          // update time every 2 hours
+  Alarm.timerRepeat(14400, callNTP);          // update time every 4 hours
   Alarm.timerRepeat(60, resetMinute);        // reset values every minute
+  Serial.println("Monitoring Starting!");
 }
 
 void loop() {
@@ -202,25 +240,25 @@ void loop() {
   if (currentMillis >= (cloopTime + 1000))
   {
     // Disable the interrupt while calculating flow rate and sending the value to the host
-    //201215noInterrupts(); //Disable the interrupts on the Arduino
+    //201215 noInterrupts(); //Disable the interrupts on the Arduino
     //detachInterrupt(sensorInterrupt1); // sensorInterrupt = 0
     cloopTime = currentMillis; // Updates cloopTime
 
     //Start the math
-    if (count1 != 0  || count2 != 0) {  // if there is output from the flow meter
-      flowRate1 = (count1 * 2.25);        //Take counted pulses in the last second and multiply by 2.25mL
-      flowRate1 = flowRate1 * 60;         //Convert seconds to minutes, giving you mL / Minute
-      flowRate1 = flowRate1 / 1000;       //Convert mL to Liters, giving you Liters / Minute
-      flowMinute1[flowCounter] = flowMinute1[flowCounter] + ((count1 * 2.25) / 1000); //The total amount of fluid through the system in the last minute
-      flowHour1 = flowHour1  + ((count1 * 2.25) / 1000);
-      flowTotal1 = flowTotal1 + ((count1 * 2.25) / 1000); //The total amount of fluid through the system
+    if (count1 != 0  || count2 != 0) {  // if there is output from the flow sensor
+      flowRate1                  = (count1 * pulse);        //Take counted pulses in the last second and multiply by 2.25mL. Another sites suggests / 7.5
+      flowRate1                  = flowRate1 * 60;         //Convert seconds to minutes, giving you mL / Minute
+      flowRate1                  = flowRate1 / 1000;       //Convert mL to Liters, giving you Liters / Minute
+      flowMinute1[flowCounter]  += (count1 * pulse) / 1000; //The total amount of fluid through the system in the last minute
+      flowHour1                 += (count1 * pulse) / 1000;
+      flowTotal1                += (count1 * pulse) / 1000; //The total amount of fluid through the system
       
-      flowRate2 = (count2 * 2.25);        //Take counted pulses in the last second and multiply by 2.25mL
-      flowRate2 = flowRate2 * 60;         //Convert seconds to minutes, giving you mL / Minute
-      flowRate2 = flowRate2 / 1000;       //Convert mL to Liters, giving you Liters / Minute
-      flowMinute2[flowCounter] = flowMinute2[flowCounter] + ((count2 * 2.25) / 1000); //The total amount of fluid through the system in the last minute
-      flowHour2 = flowHour2  + ((count2 * 2.25) / 1000);
-      flowTotal2 = flowTotal2 + ((count2 * 2.25) / 1000); //The total amount of fluid through the system
+      flowRate2                  = (count2 * pulse);        //Take counted pulses in the last second and multiply by 2.25mL
+      flowRate2                  = flowRate2 * 60;         //Convert seconds to minutes, giving you mL / Minute
+      flowRate2                  = flowRate2 / 1000;       //Convert mL to Liters, giving you Liters / Minutef
+      flowMinute2[flowCounter]  += (count2 * pulse) / 1000; //The total amount of fluid through the system in the last minute
+      flowHour2                 += (count2 * pulse) / 1000;
+      flowTotal2                += (count2 * pulse) / 1000; //The total amount of fluid through the system
 
       epoch = epochStart + currentMillis / 1000; // update epoch to now
       // Output the flow log entry
@@ -228,46 +266,65 @@ void loop() {
       Serial.print(logtime);
       // Print the flow data
       // note these are read off the website in as an array, so changing the order will break things there. 
-      Serial.print("\tR:" + String(flowRate1) + " " + String(flowRate2) + " L/mi");
-      Serial.print("\tV(Minute):" + String(flowMinute1[flowCounter]) + " " + String(flowMinute2[flowCounter]) + " L");
-      Serial.print("\tV(Hour):" + String(flowHour1) + " " + String(flowHour2) + " L");
-      Serial.print("\tV(Total):" + String(flowTotal1) + " " + String(flowTotal2) + " L");
-      Serial.print("\tC:" + String(flowCounter));
+      // Strings build to make it easy to swap out display for different numbers of flow sensors
+      flowRate = "";
+      if (flowRate1 < 10) { flowRate = "0"; }
+      flowRate   += String(flowRate1) + ",";
+      if (flowRate2 < 10) { flowRate += "0"; }
+      flowRate   += String(flowRate2); 
+      
+      flowMinute = String(flowMinute1[flowCounter]) + "," + String(flowMinute2[flowCounter]);
+      flowHour   = String(flowHour1) + "," + String(flowHour2); 
+
+      // get rid of decimals for large values of flowTotal
+      flowTotal = "";
+      if (flowTotal1 < 10) { flowTotal += "0"; }
+      if (flowTotal1 > 999.99)  { 
+          flowTotal = String(int(flowTotal1));
+      } else {
+         flowTotal = String(flowTotal1);
+      }
+      flowTotal += ",";   
+      if (flowTotal2 < 10) { flowTotal += "0"; }
+      if (flowTotal2 > 999.99)  { 
+          flowTotal += String(int(flowTotal2));
+      } else {
+         flowTotal += String(flowTotal2);
+      }
+      
+      Serial.print("\tR:"         + flowRate   + " Lpm");
+      Serial.print("\tV(Minute):" + flowMinute + " L");
+      Serial.print("\tV(Hour):"   + flowHour   + " L");
+      Serial.print("\tV(Total):" + flowTotal   + " L");
+      Serial.print("\tCount:"        + String(flowCounter));
       Serial.println();
 
       lcd.clear();
       lcd.setCursor(0, 0);
-      lcd.print("R:" + String(flowRate1) + " " + String(flowRate2) +"L/mi");
+      lcd.print("R:" + flowRate +"Lpm");
       lcd.setCursor(0, 1);
-      lcd.print("V:");
-      // get rid of the decimals for a large enough number
-      if (flowTotal1 < 999.99)  { lcd.print(flowTotal1); }
-      else { lcd.print((int)flowTotal1); }
-      lcd.print(" ");
-      if (flowTotal2 < 999.99) { lcd.print(flowTotal2); }
-      else { lcd.print((int)flowTotal2); }
-      lcd.print("L");
+      lcd.print("V:" + flowTotal + "L");
 
       myFile = SD.open("simple.txt", FILE_WRITE);// Open SD card for writing
       if (myFile) {
         // write temps to SD card
         myFile.print(logtime);
-        myFile.print("\tR:\t" + String(flowRate1) + "\t" + String(flowRate2) + "\tL/mi");
-        myFile.print("\tV(Minute):" + String(flowMinute1[flowCounter]) + "\t" + String(flowMinute2[flowCounter]));
-        myFile.println("\tV(Total): " + String(flowTotal1) + "\t" + String(flowTotal2) + "\tL(total)");
+        myFile.print(",R:,"          + flowRate + ",Lpm");
+        myFile.print(",V(Minute):,"  + flowMinute);
+        myFile.println(",V(Total): " + flowTotal + ",L(total)");
         // close the file
         myFile.close();
       } 
       else { Serial.println("Error opening file in loop."); }
     }
     else {
-      //lcd.clear();
       // if we have no flow data, reset the LCD
+      lcd.clear();
       lcd.setCursor(0, 0);
-      lcd.print("R:0.00 0.00L/mi");
+      lcd.print("R:00.00,00.00Lpm");
       // These aren't changing so no need to rewrite them.
-      //lcd.setCursor(0, 1);
-      //lcd.print("Vol: " + String(flowTotal) + " L");
+      lcd.setCursor(0, 1);
+      lcd.print("V:" + flowTotal + "L");
     }
 
     count1 = 0;      // Reset the counter so we start counting from 0 again
@@ -394,10 +451,14 @@ void WebServer ()
           client.println("<!DOCTYPE HTML>");
           client.println("<html>");
           // Print the flow data
-          client.print("Rate (L/mi):\t" + String(flowRate1) + "\t" + String(flowRate2));
-          client.print("\tV(L/last minute):\t" + String(flowMinute1[flowCounter]) + "\t" + String(flowMinute2[flowCounter]));
-          client.print("\tV(L/last hour):\t" + String(flowHour1) + "\t" + String(flowHour2));       
-          client.println("\tV(L/total):\t" + String(flowTotal1) +"\t" + String(flowTotal2));
+//          client.print("Rate (Lpm):\t" + String(flowRate1) + "\t" + String(flowRate2));
+//          client.print("\tV(L/last minute):\t" + String(flowMinute1[flowCounter]) + "\t" + String(flowMinute2[flowCounter]));
+//          client.print("\tV(L/last hour):\t" + String(flowHour1) + "\t" + String(flowHour2));       
+//          client.println("\tV(L/total):\t" + String(flowTotal1) +"\t" + String(flowTotal2));
+          client.print("Rate (Lpm):\t" + String(flowRate1));
+          client.print("\tV(L/last minute):\t" + String(flowMinute1[flowCounter]));
+          client.print("\tV(L/last hour):\t" + String(flowHour1));       
+          client.println("\tV(L/total):\t" + String(flowTotal1) + "\tL");
           client.println("<br />");
           client.println("</html>");
           break;
@@ -422,31 +483,32 @@ void resetMinute()
   // This reset code can go away once the system is stable
   Serial.print(logtime);
   Serial.print("\tReset:" + String(flowCounter));
-  Serial.print("\t" + String(flowMinute1[flowCounter]) + "\t" + String(flowMinute2[flowCounter]));
-  Serial.print("\t" + String(flowHour1) +"\t" + String(flowHour2));
-  Serial.println("\t" + String(flowTotal1) +"\t" + String(flowTotal2));
+  Serial.print(","       + flowMinute);
+  Serial.print(","       + flowHour);
+  Serial.println(","     + flowTotal);
   
-  // keep a running total for the last 60 minutes
+  // keep a running total for the last flowInterval minutes
   byte index = 0;
-  // reset the value for the last 60 minutes
+  // reset the value for the last flowInterval minutes
   flowHour1 = 0;
   flowHour2 = 0;
-  // Sum up all the results in the last 60 minutes
-  for(index = 0; index < 60 ; index++)  { 
+  // Sum up all the results in the last flowInterval minutes
+  for(index = 0; index < flowInterval ; index++)  { 
     flowHour1 += flowMinute1[index]; 
     flowHour2 += flowMinute2[index]; 
   }
   // reset the most recent minute's value
   // increment the minute counter
   flowCounter += 1;
-  // reset the minute counter if it's the next hour
-  if (flowCounter > 59) { 
+  // reset the minute counter if it's the next flowInterval minutes
+  if (flowCounter > (flowInterval-1)) { 
     flowCounter = 0;
     // write out the data for this hour (so this function is hourly
     myFile = SD.open("last.txt", O_WRITE | O_CREAT |O_TRUNC);// Open SD card for writing, not append
     if (myFile) {
         // write temps to SD card
-        myFile.println(String(flowTotal1) + "," + String(flowTotal2));         //Print the variable flowRate and flowTotal to Serial
+//        myFile.println(String(flowTotal1) + "," + String(flowTotal2));         //Print the variable flowRate and flowTotal to Serial
+        myFile.println(flowTotal1);         //Print the variable flowRate and flowTotal to Serial
         myFile.println(logtime);
         // close the file
         myFile.close();
